@@ -1,0 +1,418 @@
+import requests
+import geopandas as gpd
+import pandas as pd
+from shapely.geometry import Point
+import json
+
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+BASE_URL = (
+    "https://services1.arcgis.com/IOnDXYLCAWAfoO54/arcgis/rest/services"
+    "/Geocatmin_Peligros_Geol%C3%B3gicos_del_Per%C3%BA_2018/FeatureServer"
+)
+LAYER_ID = 1          # ajustar si hay varias capas (ver paso 1)
+OUTPUT_SHP = r"C:\Users\usuario\OneDrive\Desktop\AFP INTEGRA\ESG\Riesgos Fisicos\Proyecto Expected Loss\peligros_geologicos_peru.shp"
+OUTPUT_CSV = r"C:\Users\usuario\OneDrive\Desktop\AFP INTEGRA\ESG\Riesgos Fisicos\Proyecto Expected Loss\peligros_geologicos_peru.csv"
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── PASO 1: ver qué capas tiene el servicio ──────────────────────────────────
+r = requests.get(BASE_URL, params={"f": "json"}, timeout=30)
+info = r.json()
+print("=== CAPAS DISPONIBLES ===")
+for layer in info.get("layers", []):
+    print(f"  [{layer['id']}] {layer['name']}")
+
+# ── PASO 2: contar registros totales ─────────────────────────────────────────
+count_url = f"{BASE_URL}/{LAYER_ID}/query"
+r = requests.get(count_url, params={
+    "where": "1=1",
+    "returnCountOnly": "true",
+    "f": "json"
+}, timeout=30)
+total = r.json()["count"]
+print(f"\nTotal de eventos: {total:,}")
+
+# ── PASO 3: descarga paginada (ArcGIS limita a 1000-2000 por request) ────────
+features = []
+offset = 0
+page_size = 1000
+
+while offset < total:
+    r = requests.get(count_url, params={
+        "where": "1=1",
+        "outFields": "*",          # todos los campos
+        "returnGeometry": "true",
+        "geometryType": "esriGeometryPoint",
+        "outSR": "4326",           # WGS84
+        "resultOffset": offset,
+        "resultRecordCount": page_size,
+        "f": "geojson"
+    }, timeout=60)
+    
+    chunk = r.json()
+    feats = chunk.get("features", [])
+    features.extend(feats)
+    offset += page_size
+    print(f"  Descargados: {min(offset, total):,} / {total:,}", end="\r")
+
+print(f"\nDescarga completa: {len(features):,} eventos")
+
+# ── PASO 4: convertir a GeoDataFrame ─────────────────────────────────────────
+geojson = {"type": "FeatureCollection", "features": features}
+gdf = gpd.GeoDataFrame.from_features(geojson["features"], crs="EPSG:4326")
+
+print("\nColumnas disponibles:")
+print(list(gdf.columns))
+print(f"\nTipos de evento:")
+# ajustar el nombre de columna según lo que imprima arriba
+tipo_col = next((c for c in gdf.columns if "tipo" in c.lower() or "type" in c.lower()), None)
+if tipo_col:
+    print(gdf[tipo_col].value_counts().head(20))
+
+# ── PASO 5: exportar ─────────────────────────────────────────────────────────
+gdf.to_file(OUTPUT_SHP, encoding="utf-8")
+gdf.drop(columns="geometry").to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+print(f"\nGuardado: {OUTPUT_SHP}")
+print(f"Guardado: {OUTPUT_CSV}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import geopandas as gpd
+import pandas as pd
+
+BASE = r"C:\Users\usuario\OneDrive\Desktop\AFP INTEGRA\ESG\Riesgos Fisicos\Proyecto Expected Loss"
+SHP_EVENTOS   = f"{BASE}\\peligros_geologicos_peru.shp"
+SHP_DISTRITOS = f"{BASE}\\DISTRITOS.shp"
+OUTPUT_CSV    = f"{BASE}\\hazard_historico_por_distrito.csv"
+
+gdf_ev   = gpd.read_file(SHP_EVENTOS).to_crs("EPSG:4326")
+gdf_dist = gpd.read_file(SHP_DISTRITOS).to_crs("EPSG:4326")
+
+# ── Spatial join ──────────────────────────────────────────────────────────────
+joined = gpd.sjoin(
+    gdf_ev,
+    gdf_dist[["geometry", "UBIGEO", "DISTRITO", "PROVINCIA", "DEPARTAMEN"]],
+    how="left", predicate="within"
+)
+
+# ── Conteo total por distrito ─────────────────────────────────────────────────
+hazard = (
+    joined.groupby(["UBIGEO", "DISTRITO", "PROVINCIA", "DEPARTAMEN"])
+    .size()
+    .reset_index(name="n_eventos_total")
+)
+
+# ── Desglose por tipo de evento (pivot) ───────────────────────────────────────
+pivot = (
+    joined.groupby(["UBIGEO", "TIPO_PELIG"])
+    .size()
+    .unstack(fill_value=0)
+    .reset_index()
+)
+pivot.columns.name = None
+
+# ── Merge ─────────────────────────────────────────────────────────────────────
+hazard = hazard.merge(pivot, on="UBIGEO", how="left")
+
+# ── Score normalizado 0-1 ─────────────────────────────────────────────────────
+hazard["hazard_score"] = hazard["n_eventos_total"] / hazard["n_eventos_total"].max()
+
+# ── Estadísticas ──────────────────────────────────────────────────────────────
+print(f"Distritos con al menos 1 evento: {(hazard['n_eventos_total'] > 0).sum()}")
+print(f"\nTop 10 distritos con más eventos:")
+print(hazard.nlargest(10, "n_eventos_total")[
+    ["DISTRITO", "PROVINCIA", "DEPARTAMEN", "n_eventos_total"]
+].to_string(index=False))
+
+# ── Exportar ──────────────────────────────────────────────────────────────────
+hazard.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+print(f"\nGuardado: {OUTPUT_CSV}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import geopandas as gpd
+import pandas as pd
+import os
+from shapely.validation import make_valid
+
+FOLDER   = r"C:\Users\usuario\OneDrive\Desktop\AFP INTEGRA\ESG\Riesgos Fisicos\Proyecto Expected Loss\Suceptibilidad"
+SHP_DIST = r"C:\Users\usuario\OneDrive\Desktop\AFP INTEGRA\ESG\Riesgos Fisicos\Proyecto Expected Loss\DISTRITOS.shp"
+OUTPUT   = r"C:\Users\usuario\OneDrive\Desktop\AFP INTEGRA\ESG\Riesgos Fisicos\Proyecto Expected Loss\susceptibilidad_por_distrito.csv"
+
+GRIDCODE_MAP = {1: "Muy bajo", 2: "Bajo", 3: "Medio", 4: "Alto", 5: "Muy alto"}
+ORDEN        = {"Muy bajo": 1, "Bajo": 2, "Medio": 3, "Alto": 4, "Muy alto": 5}
+SKIP         = {"SIGRID_ambito_del_documento_3665.shp", "smm_loreto_poly.shp"}
+
+# ── Centroides de distritos (puntos) — mucho más liviano que polígonos ────────
+dist = gpd.read_file(SHP_DIST).to_crs("EPSG:4326")
+dist_pts = dist[["UBIGEO", "DISTRITO", "PROVINCIA", "DEPARTAMEN", "geometry"]].copy()
+dist_pts["geometry"] = dist_pts["geometry"].centroid   # un punto por distrito
+print(f"Distritos (centroides): {len(dist_pts):,}")
+
+# ── Procesar cada shapefile por separado y hacer join inmediato ───────────────
+resultados = []
+
+for fname in sorted(os.listdir(FOLDER)):
+    if not fname.endswith(".shp") or fname in SKIP:
+        continue
+
+    path = os.path.join(FOLDER, fname)
+    try:
+        gdf = gpd.read_file(path)
+
+        # CRS
+        if gdf.crs is None:
+            gdf = gdf.set_crs("EPSG:32718")
+        gdf = gdf.to_crs("EPSG:4326")
+
+        # Reparar geometrías
+        gdf["geometry"] = gdf["geometry"].apply(
+            lambda g: make_valid(g) if g is not None else g
+        )
+        gdf = gdf[gdf["geometry"].notna() & gdf["geometry"].is_valid]
+
+        # Normalizar GRADO
+        if "GRADO" not in gdf.columns:
+            gc_col = next((c for c in gdf.columns if c.lower() == "gridcode"), None)
+            if gc_col:
+                gdf["GRADO"] = gdf[gc_col].map(GRIDCODE_MAP)
+            elif "des_susp_m" in gdf.columns:
+                gdf["GRADO"] = gdf["des_susp_m"]
+            elif "DESCRIP" in gdf.columns:
+                gdf["GRADO"] = gdf["DESCRIP"]
+            else:
+                print(f"  ⚠ Sin columna de grado: {fname} — omitido")
+                continue
+
+        gdf = gdf[["GRADO", "geometry"]]
+
+        # Join: centroide de distrito dentro de qué polígono de susceptibilidad cae
+        joined = gpd.sjoin(
+            dist_pts,                          # puntos (1,891 filas)
+            gdf,                               # polígonos de susceptibilidad
+            how="left",
+            predicate="within"
+        )
+
+        # Quedarse con el grado más alto si un centroide cayó en varios polígonos
+        joined["GRADO_NUM"] = joined["GRADO"].map(ORDEN)
+        best = (
+            joined.groupby("UBIGEO")["GRADO_NUM"]
+            .max()
+            .reset_index()
+            .rename(columns={"GRADO_NUM": f"GRADO_{fname[:15]}"})
+        )
+        resultados.append(best)
+        print(f"✓ {fname}: {(best.iloc[:,1] > 0).sum()} distritos asignados")
+
+        # Liberar memoria
+        del gdf, joined
+
+    except Exception as e:
+        print(f"✗ ERROR {fname}: {e}")
+
+# ── Combinar todos los resultados ─────────────────────────────────────────────
+print("\nCombinando resultados...")
+final = dist[["UBIGEO", "DISTRITO", "PROVINCIA", "DEPARTAMEN"]].copy()
+
+for df in resultados:
+    final = final.merge(df, on="UBIGEO", how="left")
+
+# Columna de susceptibilidad máxima entre todos los archivos disponibles
+grado_cols = [c for c in final.columns if c.startswith("GRADO_")]
+final["SUSC_MAX_NUM"] = final[grado_cols].max(axis=1)
+final["SUSC_MAX"]     = final["SUSC_MAX_NUM"].map({v: k for k, v in ORDEN.items()})
+
+print(f"\nDistribución SUSC_MAX:")
+print(final["SUSC_MAX"].value_counts())
+
+final.to_csv(OUTPUT, index=False, encoding="utf-8-sig")
+print(f"\nGuardado: {OUTPUT}")
+
+
+
+
+
+import pandas as pd
+
+BASE = r"C:\Users\usuario\OneDrive\Desktop\AFP INTEGRA\ESG\Riesgos Fisicos\Proyecto Expected Loss"
+
+# Cargar las dos tablas ya generadas
+hazard = pd.read_csv(f"{BASE}\\hazard_historico_por_distrito.csv", dtype={"UBIGEO": str})
+susc   = pd.read_csv(f"{BASE}\\susceptibilidad_por_distrito.csv",  dtype={"UBIGEO": str})
+
+# Merge por UBIGEO
+master = hazard.merge(
+    susc[["UBIGEO", "SUSC_MAX", "SUSC_MAX_NUM"]],
+    on="UBIGEO", how="left"
+)
+
+print(f"Filas: {len(master):,}")
+print(f"Columnas: {list(master.columns)}")
+print(f"\nCobertura SUSC_MAX: {master['SUSC_MAX'].notna().sum()} de {len(master)} distritos")
+master.to_csv(f"{BASE}\\master_hazard_susc.csv", index=False, encoding="utf-8-sig")
+print("Guardado: master_hazard_susc.csv")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import requests
+import rasterio
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import os
+
+BASE     = r"C:\Users\usuario\OneDrive\Desktop\AFP INTEGRA\ESG\Riesgos Fisicos\Proyecto Expected Loss"
+TIF_OUT  = f"{BASE}\\lhasa_susceptibility_global.tif"
+CSV_OUT  = f"{BASE}\\lhasa_susceptibilidad_por_distrito.csv"
+SHP_DIST = f"{BASE}\\DISTRITOS.shp"
+
+# ── PASO 1: Descargar GeoTIFF (~200MB) ───────────────────────────────────────
+URL = "https://gpm.nasa.gov/sites/default/files/downloads/global-landslide-susceptibility-map-2-27-23.tif"
+
+print("Descargando LHASA GeoTIFF...")
+r = requests.get(URL, stream=True, timeout=300)
+total = int(r.headers.get("content-length", 0))
+descargado = 0
+
+with open(TIF_OUT, "wb") as f:
+    for chunk in r.iter_content(chunk_size=1024 * 1024):
+        f.write(chunk)
+        descargado += len(chunk)
+        if total:
+            print(f"  {descargado/1e6:.1f} MB / {total/1e6:.1f} MB", end="\r")
+
+print(f"\nGuardado: {TIF_OUT}")
+
+# ── PASO 2: Extraer valor LHASA por centroide de distrito ────────────────────
+LHASA_MAP = {1: "Muy baja", 2: "Baja", 3: "Moderada", 4: "Alta", 5: "Muy alta"}
+
+dist = gpd.read_file(SHP_DIST).to_crs("EPSG:4326")
+
+# Centroides con CRS proyectado para precisión
+dist_proj = dist.to_crs("EPSG:32718")
+dist["lon"] = dist_proj.geometry.centroid.to_crs("EPSG:4326").x
+dist["lat"] = dist_proj.geometry.centroid.to_crs("EPSG:4326").y
+
+print("Extrayendo valores LHASA por distrito...")
+valores = []
+with rasterio.open(TIF_OUT) as src:
+    print(f"  Raster CRS   : {src.crs}")
+    print(f"  Raster shape : {src.width}×{src.height} px")
+    print(f"  Valores únicos (muestra): verificando...")
+
+    coords = list(zip(dist["lon"], dist["lat"]))
+    for val in src.sample(coords):
+        valores.append(int(val[0]) if val[0] != src.nodata else np.nan)
+
+dist["LHASA_NUM"]  = valores
+dist["LHASA_SUSC"] = dist["LHASA_NUM"].map(LHASA_MAP)
+
+# ── PASO 3: Resultado y exportar ─────────────────────────────────────────────
+resultado = dist[["UBIGEO", "DISTRITO", "PROVINCIA", "DEPARTAMEN",
+                   "LHASA_NUM", "LHASA_SUSC"]].copy()
+
+print(f"\nDistribución LHASA_SUSC:")
+print(resultado["LHASA_SUSC"].value_counts())
+print(f"Sin dato (nodata/0): {resultado['LHASA_SUSC'].isna().sum()}")
+print(f"\nTop 10 distritos susceptibilidad Alta/Muy alta:")
+print(resultado[resultado["LHASA_NUM"] >= 4]
+      .sort_values("LHASA_NUM", ascending=False)
+      [["DISTRITO", "PROVINCIA", "DEPARTAMEN", "LHASA_SUSC"]]
+      .head(10).to_string(index=False))
+
+resultado.to_csv(CSV_OUT, index=False, encoding="utf-8-sig")
+print(f"\nGuardado: {CSV_OUT}")
+
+
+
+import pandas as pd
+
+BASE = r"C:\Users\usuario\OneDrive\Desktop\AFP INTEGRA\ESG\Riesgos Fisicos\Proyecto Expected Loss"
+
+# Tabla base = todos los distritos (desde LHASA que tiene cobertura 99.8%)
+lhasa  = pd.read_csv(f"{BASE}\\lhasa_susceptibilidad_por_distrito.csv", dtype={"UBIGEO": str})
+hazard = pd.read_csv(f"{BASE}\\hazard_historico_por_distrito.csv",       dtype={"UBIGEO": str})
+susc   = pd.read_csv(f"{BASE}\\susceptibilidad_por_distrito.csv",        dtype={"UBIGEO": str})
+
+# Base: 1,891 distritos desde LHASA
+master = lhasa[["UBIGEO", "DISTRITO", "PROVINCIA", "DEPARTAMEN", "LHASA_NUM", "LHASA_SUSC"]].copy()
+
+# Agregar hazard histórico (NaN donde no hubo eventos = 0 eventos, no falta de dato)
+cols_hazard = ["UBIGEO", "n_eventos_total", "Caida", "Deslizamiento",
+               "Desplaz. Lateral", "Flujo", "Mov. Complejo", "Reptacion",
+               "Vuelco", "hazard_score"]
+master = master.merge(hazard[cols_hazard], on="UBIGEO", how="left")
+
+# Rellenar NaN de eventos con 0 (distrito sin eventos registrados ≠ sin dato)
+cols_eventos = ["n_eventos_total", "Caida", "Deslizamiento", "Desplaz. Lateral",
+                "Flujo", "Mov. Complejo", "Reptacion", "Vuelco", "hazard_score"]
+master[cols_eventos] = master[cols_eventos].fillna(0)
+
+# Agregar susceptibilidad INGEMMET
+master = master.merge(
+    susc[["UBIGEO", "SUSC_MAX", "SUSC_MAX_NUM"]],
+    on="UBIGEO", how="left"
+)
+
+# Verificar
+print(f"Filas totales       : {len(master):,}  ← debe ser 1,891")
+print(f"Con eventos > 0     : {(master['n_eventos_total'] > 0).sum():,}")
+print(f"LHASA cubierto      : {master['LHASA_SUSC'].notna().sum():,}")
+print(f"SUSC_MAX cubierto   : {master['SUSC_MAX'].notna().sum():,}")
+print(f"\nColumnas: {list(master.columns)}")
+
+master.to_csv(f"{BASE}\\master_movimientos_en_masa.csv", index=False, encoding="utf-8-sig")
+print(f"\nGuardado: master_movimientos_en_masa.csv")
