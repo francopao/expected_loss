@@ -1,0 +1,104 @@
+import requests
+import rasterio
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import os
+
+# ─── PATHS ────────────────────────────────────────────────────────────────────
+BASE     = r"C:\Users\usuario\OneDrive\Desktop\AFP INTEGRA\ESG\Riesgos Fisicos\Proyecto Expected Loss"
+SHP_DIST = f"{BASE}\\DISTRITOS.shp"
+# CSV con los distritos que ya tienen exposición de cartera
+# (viene de master_movimientos_en_masa.csv que ya tiene UBIGEO de distritos con activos)
+MASTER   = f"{BASE}\\master_movimientos_en_masa.csv"
+OUT_CSV  = f"{BASE}\\wri_inundacion_por_distrito.csv"
+TIF_DIR  = f"{BASE}\\WRI_Tifs"
+os.makedirs(TIF_DIR, exist_ok=True)
+
+# ─── ARCHIVOS A DESCARGAR ─────────────────────────────────────────────────────
+BASE_URL = "http://wri-projects.s3.amazonaws.com/AqueductFloodTool/download/v2/"
+
+TIFS = {
+    "riv_hist_rp100":  "inunriver_historical_000000000WATCH_1980_rp00100.tif",
+    "riv_hist_rp1000": "inunriver_historical_000000000WATCH_1980_rp01000.tif",
+    "riv_2030_rp100":  "inunriver_rcp8p5_00000NorESM1-M_2030_rp00100.tif",
+    "riv_2050_rp100":  "inunriver_rcp8p5_00000NorESM1-M_2050_rp00100.tif",
+}
+
+# ─── PASO 1: Descargar los 4 GeoTIFFs (~300-500 MB cada uno) ─────────────────
+for col, fname in TIFS.items():
+    dest = os.path.join(TIF_DIR, fname)
+    if os.path.exists(dest):
+        print(f"Ya existe: {fname}")
+        continue
+    url = BASE_URL + fname
+    print(f"Descargando {fname}...")
+    r = requests.get(url, stream=True, timeout=300)
+    total = int(r.headers.get("content-length", 0))
+    descargado = 0
+    with open(dest, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024*1024):
+            f.write(chunk)
+            descargado += len(chunk)
+            if total:
+                print(f"  {descargado/1e6:.0f} MB / {total/1e6:.0f} MB", end="\r")
+    print(f"\n✓ Guardado: {dest}")
+
+# ─── PASO 2: Cargar distritos CON exposición de cartera ──────────────────────
+master = pd.read_csv(MASTER, dtype={"UBIGEO": str})
+print(f"Distritos en master: {len(master):,}")
+
+# Cargar shapefile y calcular centroides
+dist = gpd.read_file(SHP_DIST).to_crs("EPSG:4326")
+dist_proj = dist.to_crs("EPSG:32718")
+dist["lon"] = dist_proj.geometry.centroid.to_crs("EPSG:4326").x
+dist["lat"] = dist_proj.geometry.centroid.to_crs("EPSG:4326").y
+
+# Filtrar solo los que tienen exposición (están en master)
+dist_exp = dist[dist["UBIGEO"].isin(master["UBIGEO"])].copy()
+print(f"Distritos con exposición de cartera: {len(dist_exp):,}")
+
+coords = list(zip(dist_exp["lon"], dist_exp["lat"]))
+
+# ─── PASO 3: Extraer profundidad de inundación por centroide ─────────────────
+resultados = {}
+
+for col, fname in TIFS.items():
+    path = os.path.join(TIF_DIR, fname)
+    print(f"\nExtrayendo {col}...")
+    valores = []
+    with rasterio.open(path) as src:
+        print(f"  CRS: {src.crs} | NoData: {src.nodata}")
+        for val in src.sample(coords):
+            v = float(val[0])
+            # WRI usa -9999 o nodata para zonas sin inundación → convertir a 0
+            if src.nodata is not None and abs(v - src.nodata) < 1:
+                v = 0.0
+            elif v < 0:
+                v = 0.0
+            valores.append(round(v, 4))
+    resultados[col] = valores
+    print(f"  ✓ {col}: max={max(valores):.2f}m, distritos con inundación={(np.array(valores)>0).sum()}")
+
+# ─── PASO 4: Armar tabla final ────────────────────────────────────────────────
+df_wri = dist_exp[["UBIGEO", "DISTRITO", "PROVINCIA", "DEPARTAMEN"]].copy()
+for col, vals in resultados.items():
+    df_wri[col] = vals
+
+# Cambio incremental RCP8.5: cuánto sube la profundidad respecto al histórico
+df_wri["delta_2030_rp100"] = (df_wri["riv_2030_rp100"] - df_wri["riv_hist_rp100"]).round(4)
+df_wri["delta_2050_rp100"] = (df_wri["riv_2050_rp100"] - df_wri["riv_hist_rp100"]).round(4)
+
+# ─── PASO 5: Estadísticas rápidas ────────────────────────────────────────────
+print("\n=== RESUMEN ===")
+print(f"Distritos con inundación histórica RP100 > 0m : {(df_wri['riv_hist_rp100']>0).sum()}")
+print(f"Distritos con inundación histórica RP1000 > 0m: {(df_wri['riv_hist_rp1000']>0).sum()}")
+print(f"\nTop 10 distritos más afectados (RP100 histórico):")
+print(df_wri.nlargest(10, "riv_hist_rp100")[
+    ["DISTRITO", "PROVINCIA", "DEPARTAMEN",
+     "riv_hist_rp100", "riv_hist_rp1000",
+     "riv_2030_rp100", "delta_2030_rp100"]
+].to_string(index=False))
+
+df_wri.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+print(f"\nGuardado: {OUT_CSV}")
