@@ -1,8 +1,82 @@
-# ── PASO 5: exportar ─────────────────────────────────────────────────────────
-# GeoPackage reserva "FID" como PK; renombrar o soltar para evitar conflicto
-gdf_export = gdf.drop(columns=[c for c in ["FID"] if c in gdf.columns])
+import requests
+import geopandas as gpd
+import pandas as pd
 
-gdf_export.to_file(OUTPUT_GPKG, driver="GPKG", layer="peligros_geologicos")
-gdf_export.drop(columns="geometry").to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+BASE_URL = (
+    "https://services1.arcgis.com/IOnDXYLCAWAfoO54/arcgis/rest/services"
+    "/Geocatmin_Peligros_Geol%C3%B3gicos_del_Per%C3%BA_2018/FeatureServer"
+)
+LAYER_ID = 1          # ajustar si hay varias capas (ver PASO 1)
+
+# GeoPackage en vez de shapefile: NO trunca nombres de columna a 10 caracteres
+OUTPUT_GPKG = r"Z:\Mesa de Inversiones\Bottom-Up\2 Proceso de Inversión Renta Fija\Corporates - Emisiones\Crédito - BU\3. ESG\21. TCFD\Reporte TCFD\Reporte TCFD\Mapeo de Distribución de Distritos - Riesgos Fisicos\Python\Expected Loss\Geocatmin\peligros_geologicos_peru.gpkg"
+OUTPUT_CSV = r"Z:\Mesa de Inversiones\Bottom-Up\2 Proceso de Inversión Renta Fija\Corporates - Emisiones\Crédito - BU\3. ESG\21. TCFD\Reporte TCFD\Reporte TCFD\Mapeo de Distribución de Distritos - Riesgos Fisicos\Python\Expected Loss\Geocatmin\peligros_geologicos_peru.csv"
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── PASO 1: ver qué capas tiene el servicio ──────────────────────────────────
+r = requests.get(BASE_URL, params={"f": "json"}, timeout=30)
+info = r.json()
+print("=== CAPAS DISPONIBLES ===")
+for layer in info.get("layers", []):
+    print(f"  [{layer['id']}] {layer['name']}")
+
+# ── PASO 2: contar registros totales ─────────────────────────────────────────
+query_url = f"{BASE_URL}/{LAYER_ID}/query"
+r = requests.get(query_url, params={
+    "where": "1=1",
+    "returnCountOnly": "true",
+    "f": "json"
+}, timeout=30)
+total = r.json()["count"]
+print(f"\nTotal de eventos: {total:,}")
+
+# ── PASO 3: descarga paginada (ArcGIS limita a 1000-2000 por request) ────────
+features = []
+offset = 0
+page_size = 1000
+
+while offset < total:
+    r = requests.get(query_url, params={
+        "where": "1=1",
+        "outFields": "*",          # todos los campos
+        "returnGeometry": "true",
+        "geometryType": "esriGeometryPoint",
+        "outSR": "4326",           # WGS84
+        "resultOffset": offset,
+        "resultRecordCount": page_size,
+        "f": "geojson"
+    }, timeout=60)
+
+    chunk = r.json()
+    feats = chunk.get("features", [])
+
+    # Corte de seguridad: si una página vuelve vacía, paramos
+    # (evita bucle infinito si total y paginación se desalinean)
+    if not feats:
+        break
+
+    features.extend(feats)
+    offset += page_size
+    print(f"  Descargados: {min(offset, total):,} / {total:,}", end="\r")
+
+print(f"\nDescarga completa: {len(features):,} eventos")
+
+# ── PASO 4: convertir a GeoDataFrame ─────────────────────────────────────────
+gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
+
+print("\nColumnas disponibles:")
+print(list(gdf.columns))
+
+# Tipos de evento (ajustar nombre de columna según lo que imprima arriba)
+tipo_col = next((c for c in gdf.columns
+                 if "tipo" in c.lower() or "type" in c.lower()), None)
+if tipo_col:
+    print(f"\nTipos de evento ({tipo_col}):")
+    print(gdf[tipo_col].value_counts().head(20))
+
+# ── PASO 5: exportar ─────────────────────────────────────────────────────────
+gdf.to_file(OUTPUT_GPKG, driver="GPKG", layer="peligros_geologicos")
+gdf.drop(columns="geometry").to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
 print(f"\nGuardado: {OUTPUT_GPKG}")
 print(f"Guardado: {OUTPUT_CSV}")
